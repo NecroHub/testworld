@@ -33,7 +33,8 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
 // ---------- CONFIG ----------
-const RAW = 'https://raw.githubusercontent.com/NecroHub/testworld/main/';
+// raw.githubusercontent.com serves files as text/plain, which browsers refuse for audio. jsDelivr serves them correctly.
+const CDN = 'https://cdn.jsdelivr.net/gh/NecroHub/testworld@main/';
 const burpFiles = [
   'A_wet,_strained_burp_#1-1792486381549.mp3',
   'A_wet,_strained_burp_#2-1792486384120.mp3',
@@ -55,7 +56,8 @@ const CONFIG = {
   moveSpeed: 4,
   turnSpeed: 12,
   // encodeURIComponent so the commas and # in the file names survive
-  BURP_SOUNDS: burpFiles.map(f => RAW + encodeURIComponent(f)),
+  // each entry = list of sources to try in order: jsDelivr (proper audio headers + CORS), then a local copy
+  BURP_SOUNDS: burpFiles.map(f => [CDN + encodeURIComponent(f), encodeURIComponent(f)]),
 };
 
 // ---------- DOM / STATE ----------
@@ -167,12 +169,21 @@ function makeAnimator(root, clips) {
       next.play();
       base = next;
     },
+    // plays a one-shot clip; returns a promise that resolves when it finishes (immediately if no such clip)
     overlay(name) {
       const a = actions[name.toLowerCase()];
-      if (!a) return;
+      if (!a) return Promise.resolve();
       a.reset().setLoop(THREE.LoopOnce, 1);
       a.clampWhenFinished = false;
-      a.play();
+      return new Promise(res => {
+        const h = e => {
+          if (e.action !== a) return;
+          mixer.removeEventListener('finished', h);
+          res();
+        };
+        mixer.addEventListener('finished', h);
+        a.play();
+      });
     },
     update(dt) { mixer.update(dt); },
   };
@@ -205,20 +216,45 @@ function synthBurp() {
   osc.stop(t0 + dur); lfo.stop(t0 + dur);
 }
 
+const getCtx = () => (audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)());
+
+// fetch + decode every burp up front so the click plays instantly
+const burpBuffers = [];
+async function loadBurp(sources) {
+  for (const url of sources) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const buf = await getCtx().decodeAudioData(await res.arrayBuffer());
+      console.log('Loaded burp:', url, buf.duration.toFixed(2) + 's');
+      return buf;
+    } catch (err) {
+      console.warn('Burp source failed (' + url + '):', err.message || err);
+    }
+  }
+  return null;
+}
+Promise.all(CONFIG.BURP_SOUNDS.map(loadBurp)).then(list => {
+  list.forEach(b => b && burpBuffers.push(b));
+  console.log(burpBuffers.length + '/' + CONFIG.BURP_SOUNDS.length + ' burp sounds ready');
+});
+
+// returns a promise that resolves when the sound has finished
 function playBurp() {
-  const list = CONFIG.BURP_SOUNDS;
-  if (!list.length) return synthBurp();
-  let i;
-  do { i = Math.floor(Math.random() * list.length); } while (list.length > 1 && i === lastBurp);
-  lastBurp = i;
-  const url = list[i];
-  let a = audioCache.get(url);
-  if (!a) { a = new Audio(url); audioCache.set(url, a); }
-  a.currentTime = 0;
-  a.play().catch(err => {
-    console.warn('Burp sound failed (' + url + '), using synth fallback:', err);
+  const ctx = getCtx();
+  if (ctx.state === 'suspended') ctx.resume();
+  if (!burpBuffers.length) {
+    console.warn('No burp files loaded, using synth fallback');
     synthBurp();
-  });
+    return new Promise(r => setTimeout(r, 1000));
+  }
+  let i;
+  do { i = Math.floor(Math.random() * burpBuffers.length); } while (burpBuffers.length > 1 && i === lastBurp);
+  lastBurp = i;
+  const src = ctx.createBufferSource();
+  src.buffer = burpBuffers[i];
+  src.connect(ctx.destination);
+  return new Promise(res => { src.onended = res; src.start(); });
 }
 
 // ---------- ASSETS ----------
@@ -398,13 +434,21 @@ function resetWorld() {
 }
 
 // ---------- BUTTONS ----------
-btnBurp.addEventListener('click', () => {
-  playBurp();
-  girlAnim.overlay('burp');
+let burping = false;
+btnBurp.addEventListener('click', async () => {
+  if (burping || state.digesting) return;
+  burping = true;
+  btnBurp.disabled = true;
+  btnDigest.disabled = true;
+  // sound and animation start together; buttons stay locked until BOTH are done
+  await Promise.all([playBurp(), girlAnim.overlay('burp')]);
+  burping = false;
+  btnBurp.disabled = false;
+  btnDigest.disabled = !(prey && digestTarget) || state.digesting || state.digested;
 });
 
 btnDigest.addEventListener('click', () => {
-  if (!prey || !digestTarget || state.digesting || state.digested) return;
+  if (burping || !prey || !digestTarget || state.digesting || state.digested) return;
   state.digesting = true;
   btnDigest.disabled = true;
 

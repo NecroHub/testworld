@@ -37,13 +37,14 @@ const CONFIG = {
   girlUrl: 'GirlModel.glb',
   boyUrl: 'Boymodel.glb',
   stomachUrl: 'Stomach_Inside_small.glb',
-  preyName: 'prey1',
-  digestTargetName: 'bellydigest',
-  boySpawnName: 'boyspawn',                 // optional node in the stomach; falls back to near prey1
-  stomachOffset: new THREE.Vector3(0, 0, -500),
-  digestDuration: 4.0,                      // seconds
-  moveSpeed: 4,                             // units per second (WASD / arrows)
+  preyName: 'BellyPrey1',            // "prey1" (falls back to any node containing "prey1")
+  digestTargetName: 'BellyDigest',   // "bellydigest"
+  hiddenExtras: ['BellyPrey2'],      // belly nodes that stay hidden
+  stomachOffset: new THREE.Vector3(0, 0, -500), // stomach lives far away; the camera never goes there
   boyPosition: new THREE.Vector3(3, 0, -2),
+  digestDuration: 4.0,               // seconds
+  moveSpeed: 4,                      // units per second (WASD / arrows)
+  turnSpeed: 12,                     // how fast the girl turns to face movement
   BURP_SOUNDS: ['burp1.mp3', 'burp2.mp3', 'burp3.mp3'], // put your files next to this html
 };
 
@@ -54,8 +55,9 @@ const btnBurp = document.getElementById('burp');
 const btnDigest = document.getElementById('digest');
 const btnReset = document.getElementById('reset');
 const setMsg = t => { msg.textContent = t; };
+const HINT = 'WASD / arrows: move\nDrag: orbit camera\nClick the boy.';
 
-const state = { phase: 'world', digesting: false, digested: false };
+const state = { eaten: false, digesting: false, digested: false };
 let tween = null;
 
 // ---------- RENDERER / SCENE ----------
@@ -84,14 +86,10 @@ const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.set(0, 1, 0);
 controls.enableDamping = true;
 
-// stomach lives in its own root, far from the main world
+// stomach lives in its own root, far from the world. Only the boy goes in there.
 const stomachRoot = new THREE.Group();
 stomachRoot.position.copy(CONFIG.stomachOffset);
 scene.add(stomachRoot);
-const stomachLight = new THREE.HemisphereLight(0xffb0a0, 0x401010, 1.4);
-stomachRoot.add(stomachLight);
-const stomachPoint = new THREE.PointLight(0xff8877, 40, 0, 1.5);
-stomachRoot.add(stomachPoint);
 
 // ---------- HELPERS ----------
 const loader = new GLTFLoader();
@@ -104,8 +102,36 @@ function findNode(root, name) {
   if (!hit) root.traverse(o => { if (!hit && o.name && o.name.toLowerCase().includes(lower)) hit = o; });
   return hit;
 }
-function showTree(o, v) { o.visible = v; if (v) o.traverse(c => { c.visible = true; }); }
 const ease = t => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
+
+// Animation controller: looping base animations (idle/walk) + one-shot overlays (burp)
+function makeAnimator(root, clips) {
+  const mixer = new THREE.AnimationMixer(root);
+  const actions = {};
+  clips.forEach(c => { actions[c.name.toLowerCase()] = mixer.clipAction(c); });
+  let base = null;
+  return {
+    mixer, actions,
+    has: n => !!actions[n.toLowerCase()],
+    setBase(name, fade = 0.2) {
+      const next = actions[name.toLowerCase()];
+      if (!next || next === base) return;
+      next.reset().setLoop(THREE.LoopRepeat, Infinity);
+      next.enabled = true;
+      if (base) next.crossFadeFrom(base, fade, false);
+      next.play();
+      base = next;
+    },
+    overlay(name) {
+      const a = actions[name.toLowerCase()];
+      if (!a) return;
+      a.reset().setLoop(THREE.LoopOnce, 1);
+      a.clampWhenFinished = false;
+      a.play();
+    },
+    update(dt) { mixer.update(dt); },
+  };
+}
 
 // ---------- AUDIO ----------
 const audioCache = new Map();
@@ -151,37 +177,44 @@ function playBurp() {
 }
 
 // ---------- ASSETS ----------
-let girl, boy, stomach, prey, digestTarget, boySpawn;
+let girl, boy, stomach, girlAnim, boyAnim, prey, digestTarget;
+let boyScale0 = 1;
 const preyHome = { pos: new THREE.Vector3(), quat: new THREE.Quaternion(), scale: new THREE.Vector3(1, 1, 1) };
 
 async function init() {
+  let g, b, s;
   try {
-    const [g, b, s] = await Promise.all([
-      loadGLB(CONFIG.girlUrl), loadGLB(CONFIG.boyUrl), loadGLB(CONFIG.stomachUrl)
-    ]);
-    girl = g.scene; boy = b.scene; stomach = s.scene;
+    [g, b, s] = await Promise.all([loadGLB(CONFIG.girlUrl), loadGLB(CONFIG.boyUrl), loadGLB(CONFIG.stomachUrl)]);
   } catch (err) {
     console.error(err);
     setMsg('Failed to load models.\nServe this folder over http (python -m http.server 8000) and make sure the .glb files sit next to this html.\n' + (err.message || err));
     return;
   }
+  girl = g.scene; boy = b.scene; stomach = s.scene;
 
   girl.position.set(0, 0, 0);
   scene.add(girl);
 
   boy.position.copy(CONFIG.boyPosition);
   boy.lookAt(0, boy.position.y, 0);
+  boyScale0 = boy.scale.x;
   scene.add(boy);
 
   stomachRoot.add(stomach);
-  stomachRoot.visible = true;
 
-  prey = findNode(stomach, CONFIG.preyName);
-  digestTarget = findNode(stomach, CONFIG.digestTargetName);
-  boySpawn = findNode(stomach, CONFIG.boySpawnName);
+  // animations: idle + walk on the girl, idle on the boy
+  girlAnim = makeAnimator(girl, g.animations);
+  boyAnim = makeAnimator(boy, b.animations);
+  if (!girlAnim.has('idle')) console.warn('Girl has no "Idle" clip. Clips:', g.animations.map(c => c.name));
+  if (!girlAnim.has('walk')) console.warn('Girl has no "Walk" clip. Clips:', g.animations.map(c => c.name));
+  girlAnim.setBase('idle', 0);
+  boyAnim.setBase('idle', 0);
 
-  if (!prey) console.warn('Node "' + CONFIG.preyName + '" not found in Stomach_Inside.glb');
-  if (!digestTarget) console.warn('Node "' + CONFIG.digestTargetName + '" not found in Stomach_Inside.glb');
+  // prey1 / bellydigest live on the girl model (stomach file is the fallback)
+  prey = findNode(girl, CONFIG.preyName) || findNode(stomach, CONFIG.preyName) || findNode(girl, 'prey1');
+  digestTarget = findNode(girl, CONFIG.digestTargetName) || findNode(stomach, CONFIG.digestTargetName);
+  if (!prey) console.warn('Node "' + CONFIG.preyName + '" not found');
+  if (!digestTarget) console.warn('Node "' + CONFIG.digestTargetName + '" not found');
 
   if (prey) {
     preyHome.pos.copy(prey.position);
@@ -190,16 +223,15 @@ async function init() {
     prey.visible = false;
   }
   if (digestTarget) digestTarget.visible = false;
+  CONFIG.hiddenExtras.forEach(n => { const o = findNode(girl, n); if (o) o.visible = false; });
 
-  frameCamera(girl);
-  setMsg('WASD / arrows: move girl\nDrag: orbit camera\nClick the boy.');
+  frameGirl();
+  setMsg(HINT);
 }
 
-function frameCamera(obj) {
-  const box = new THREE.Box3().setFromObject(obj);
-  const c = box.getCenter(new THREE.Vector3());
-  controls.target.set(c.x, c.y, c.z);
-  camera.position.set(c.x, c.y + 1.5, c.z + 6);
+function frameGirl() {
+  controls.target.set(girl.position.x, girl.position.y + 1, girl.position.z);
+  camera.position.set(girl.position.x, girl.position.y + 2.5, girl.position.z + 6);
 }
 
 // ---------- INPUT: MOVE ----------
@@ -207,20 +239,32 @@ const keys = new Set();
 addEventListener('keydown', e => keys.add(e.key.toLowerCase()));
 addEventListener('keyup', e => keys.delete(e.key.toLowerCase()));
 
+let targetYaw = 0;
 function moveGirl(dt) {
-  if (state.phase !== 'world' || !girl) return;
+  if (!girl) return;
   const f = (keys.has('w') || keys.has('arrowup') ? 1 : 0) - (keys.has('s') || keys.has('arrowdown') ? 1 : 0);
   const r = (keys.has('d') || keys.has('arrowright') ? 1 : 0) - (keys.has('a') || keys.has('arrowleft') ? 1 : 0);
-  if (!f && !r) return;
-  const fwd = new THREE.Vector3();
-  camera.getWorldDirection(fwd); fwd.y = 0; fwd.normalize();
-  const right = new THREE.Vector3().crossVectors(fwd, new THREE.Vector3(0, 1, 0));
-  const dir = fwd.multiplyScalar(f).add(right.multiplyScalar(r)).normalize();
-  const step = dir.clone().multiplyScalar(CONFIG.moveSpeed * dt);
-  girl.position.add(step);
-  controls.target.add(step);
-  camera.position.add(step);
-  girl.rotation.y = Math.atan2(dir.x, dir.z);
+  const moving = !!(f || r);
+
+  if (moving) {
+    const fwd = new THREE.Vector3();
+    camera.getWorldDirection(fwd); fwd.y = 0; fwd.normalize();
+    const right = new THREE.Vector3().crossVectors(fwd, new THREE.Vector3(0, 1, 0));
+    const dir = fwd.multiplyScalar(f).add(right.multiplyScalar(r)).normalize();
+    const step = dir.clone().multiplyScalar(CONFIG.moveSpeed * dt);
+    girl.position.add(step);
+    controls.target.add(step);
+    camera.position.add(step);
+    targetYaw = Math.atan2(dir.x, dir.z);
+    girlAnim.setBase('walk');
+  } else {
+    girlAnim.setBase('idle');
+  }
+
+  // smooth turn toward movement direction
+  let diff = targetYaw - girl.rotation.y;
+  diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+  girl.rotation.y += diff * Math.min(1, CONFIG.turnSpeed * dt);
 }
 
 // ---------- INPUT: CLICK BOY ----------
@@ -228,72 +272,53 @@ const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
 let downPos = null;
 
-renderer.domElement.addEventListener('pointerdown', e => { downPos = { x: e.clientX, y: e.clientY }; });
-renderer.domElement.addEventListener('pointerup', e => {
-  if (!downPos || state.phase !== 'world' || !boy) return;
-  const moved = Math.hypot(e.clientX - downPos.x, e.clientY - downPos.y);
-  downPos = null;
-  if (moved > 5) return; // it was a camera drag, not a click
-  if (hitsBoy(e)) enterStomach();
-});
-renderer.domElement.addEventListener('pointermove', e => {
-  if (state.phase !== 'world' || !boy) { renderer.domElement.style.cursor = ''; return; }
-  renderer.domElement.style.cursor = hitsBoy(e) ? 'pointer' : '';
-});
-
 function hitsBoy(e) {
   pointer.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
   raycaster.setFromCamera(pointer, camera);
   return raycaster.intersectObject(boy, true).length > 0;
 }
+renderer.domElement.addEventListener('pointerdown', e => { downPos = { x: e.clientX, y: e.clientY }; });
+renderer.domElement.addEventListener('pointerup', e => {
+  if (!downPos || !boy || state.eaten) return;
+  const moved = Math.hypot(e.clientX - downPos.x, e.clientY - downPos.y);
+  downPos = null;
+  if (moved > 5) return; // camera drag, not a click
+  if (hitsBoy(e)) eatBoy();
+});
+renderer.domElement.addEventListener('pointermove', e => {
+  renderer.domElement.style.cursor = (boy && !state.eaten && hitsBoy(e)) ? 'pointer' : '';
+});
 
-// ---------- STATE: ENTER / RESET ----------
-function enterStomach() {
-  state.phase = 'stomach';
+// ---------- STATE: EAT / RESET ----------
+function eatBoy() {
+  state.eaten = true;
   state.digesting = false;
   state.digested = false;
   tween = null;
 
-  // teleport boy into the stomach
+  // teleport the boy into the stomach (far away, camera stays on the girl)
   scene.remove(boy);
   stomachRoot.add(boy);
-  if (boySpawn) {
-    boySpawn.updateWorldMatrix(true, false);
-    const wp = new THREE.Vector3();
-    boySpawn.getWorldPosition(wp);
-    boy.position.copy(stomachRoot.worldToLocal(wp));
-  } else if (prey) {
-    boy.position.copy(preyHome.pos).add(new THREE.Vector3(1.5, 0, 0));
-  } else {
-    boy.position.set(1.5, 0, 0);
-  }
+  stomachRoot.updateWorldMatrix(true, true);
+  const sb = new THREE.Box3().setFromObject(stomach);
+  const centerWorld = sb.getCenter(new THREE.Vector3());
+  boy.position.copy(stomachRoot.worldToLocal(centerWorld));
+  boy.rotation.set(0, 0, 0);
 
-  // reveal prey1 at home pose
+  // prey1 becomes visible on the girl at its home pose
   if (prey) {
     prey.position.copy(preyHome.pos);
     prey.quaternion.copy(preyHome.quat);
     prey.scale.copy(preyHome.scale);
-    showTree(prey, true);
+    prey.visible = true;
   }
   if (digestTarget) digestTarget.visible = false;
 
-  // hide main world, show stomach
-  girl.visible = false;
-  ground.visible = false;
-  scene.background = new THREE.Color(0x2a0d10);
-  stomachRoot.updateWorldMatrix(true, true);
-
-  const focus = prey || stomach;
-  const box = new THREE.Box3().setFromObject(focus);
-  const c = box.getCenter(new THREE.Vector3());
-  const size = box.getSize(new THREE.Vector3()).length() || 3;
-  controls.target.copy(c);
-  camera.position.set(c.x, c.y + size * 0.2, c.z + Math.max(size * 1.6, 4));
-
   hud.style.display = 'flex';
-  btnDigest.disabled = !(prey && digestTarget);
   btnBurp.disabled = false;
-  setMsg('Inside the stomach.' + (!prey ? '\n(prey1 node not found, check console)' : '') + (!digestTarget ? '\n(bellydigest node not found, check console)' : ''));
+  btnDigest.disabled = !(prey && digestTarget);
+  renderer.domElement.style.cursor = '';
+  setMsg('Boy is in the stomach.' + (!prey ? '\n(prey1 node not found, check console)' : '') + (!digestTarget ? '\n(bellydigest node not found, check console)' : ''));
 }
 
 function resetWorld() {
@@ -301,37 +326,44 @@ function resetWorld() {
   stomachRoot.remove(boy);
   boy.position.copy(CONFIG.boyPosition);
   boy.lookAt(0, boy.position.y, 0);
+  boy.scale.setScalar(boyScale0);
   scene.add(boy);
-  if (prey) prey.visible = false;
+  if (prey) {
+    prey.position.copy(preyHome.pos);
+    prey.quaternion.copy(preyHome.quat);
+    prey.scale.copy(preyHome.scale);
+    prey.visible = false;
+  }
   if (digestTarget) digestTarget.visible = false;
-  girl.visible = true;
-  ground.visible = true;
-  scene.background = new THREE.Color(0x1b1f27);
-  state.phase = 'world';
+  state.eaten = false;
   state.digesting = false;
   state.digested = false;
   hud.style.display = 'none';
-  renderer.domElement.style.cursor = '';
-  frameCamera(girl);
-  setMsg('WASD / arrows: move girl\nDrag: orbit camera\nClick the boy.');
+  setMsg(HINT);
 }
 
 // ---------- BUTTONS ----------
-btnBurp.addEventListener('click', playBurp);
-btnReset.addEventListener('click', resetWorld);
+btnBurp.addEventListener('click', () => {
+  playBurp();
+  girlAnim.overlay('burp'); // plays the girl's Burp clip if she has one
+});
+
 btnDigest.addEventListener('click', () => {
   if (!prey || !digestTarget || state.digesting || state.digested) return;
   state.digesting = true;
   btnDigest.disabled = true;
 
   // target transform expressed in prey1's parent space
-  stomachRoot.updateWorldMatrix(true, true);
-  digestTarget.updateWorldMatrix(true, false);
-  const local = new THREE.Matrix4()
-    .copy(prey.parent.matrixWorld).invert()
-    .multiply(digestTarget.matrixWorld);
-  const toPos = new THREE.Vector3(), toQuat = new THREE.Quaternion(), toScale = new THREE.Vector3();
-  local.decompose(toPos, toQuat, toScale);
+  let toPos = new THREE.Vector3(), toQuat = new THREE.Quaternion(), toScale = new THREE.Vector3();
+  if (prey.parent === digestTarget.parent) {
+    toPos.copy(digestTarget.position);
+    toQuat.copy(digestTarget.quaternion);
+    toScale.copy(digestTarget.scale);
+  } else {
+    scene.updateMatrixWorld(true);
+    new THREE.Matrix4().copy(prey.parent.matrixWorld).invert()
+      .multiply(digestTarget.matrixWorld).decompose(toPos, toQuat, toScale);
+  }
 
   tween = {
     t: 0,
@@ -341,6 +373,7 @@ btnDigest.addEventListener('click', () => {
   };
   setMsg('Digesting...');
 });
+btnReset.addEventListener('click', resetWorld);
 
 function updateTween(dt) {
   if (!tween) return;
@@ -353,6 +386,8 @@ function updateTween(dt) {
     tween = null;
     state.digesting = false;
     state.digested = true;
+    prey.visible = false;          // prey1 has become bellydigest
+    digestTarget.visible = true;
     setMsg('Digest complete. Hit Reset to run it again.');
   }
 }
@@ -362,8 +397,12 @@ const clock = new THREE.Clock();
 function loop() {
   requestAnimationFrame(loop);
   const dt = Math.min(clock.getDelta(), 0.1);
-  moveGirl(dt);
-  updateTween(dt);
+  if (girl) {
+    moveGirl(dt);
+    girlAnim.update(dt);
+    boyAnim.update(dt);
+    updateTween(dt);
+  }
   controls.update();
   renderer.render(scene, camera);
 }

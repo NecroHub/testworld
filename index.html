@@ -33,19 +33,29 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
 // ---------- CONFIG ----------
+const RAW = 'https://raw.githubusercontent.com/NecroHub/testworld/main/';
+const burpFiles = [
+  'A_wet,_strained_burp_#1-1792486381549.mp3',
+  'A_wet,_strained_burp_#2-1792486384120.mp3',
+  'A_wet,_strained_burp_#3-1792486386321.mp3',
+  'A_wet,_strained_burp_#4-1792486388609.mp3',
+  'wet,_gurgling_burp_t_#2-1792486268750.mp3',
+];
+
 const CONFIG = {
   girlUrl: 'GirlModel.glb',
   boyUrl: 'Boymodel.glb',
   stomachUrl: 'Stomach_Inside_small.glb',
-  preyName: 'BellyPrey1',            // "prey1" (falls back to any node containing "prey1")
-  digestTargetName: 'BellyDigest',   // "bellydigest"
-  hiddenExtras: ['BellyPrey2'],      // belly nodes that stay hidden
-  stomachOffset: new THREE.Vector3(0, 0, -500), // stomach lives far away; the camera never goes there
+  preyName: 'BellyPrey1',
+  digestTargetName: 'BellyDigest',
+  hiddenExtras: ['BellyPrey2'],
+  stomachOffset: new THREE.Vector3(0, 0, -500),
   boyPosition: new THREE.Vector3(3, 0, -2),
-  digestDuration: 4.0,               // seconds
-  moveSpeed: 4,                      // units per second (WASD / arrows)
-  turnSpeed: 12,                     // how fast the girl turns to face movement
-  BURP_SOUNDS: ['burp1.mp3', 'burp2.mp3', 'burp3.mp3'], // put your files next to this html
+  digestDuration: 4.0,
+  moveSpeed: 4,
+  turnSpeed: 12,
+  // encodeURIComponent so the commas and # in the file names survive
+  BURP_SOUNDS: burpFiles.map(f => RAW + encodeURIComponent(f)),
 };
 
 // ---------- DOM / STATE ----------
@@ -86,7 +96,6 @@ const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.set(0, 1, 0);
 controls.enableDamping = true;
 
-// stomach lives in its own root, far from the world. Only the boy goes in there.
 const stomachRoot = new THREE.Group();
 stomachRoot.position.copy(CONFIG.stomachOffset);
 scene.add(stomachRoot);
@@ -104,7 +113,43 @@ function findNode(root, name) {
 }
 const ease = t => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
 
-// Animation controller: looping base animations (idle/walk) + one-shot overlays (burp)
+// Remove animation tracks that drive these nodes (or their children), so the
+// idle/walk clips can't hide or zero-scale the belly every frame.
+function stripTracksFor(clips, nodes) {
+  const keys = new Set();
+  nodes.filter(Boolean).forEach(n => n.traverse(o => { keys.add(o.name); keys.add(o.uuid); }));
+  clips.forEach(clip => {
+    const before = clip.tracks.length;
+    clip.tracks = clip.tracks.filter(t => {
+      const node = t.name.split('.')[0];
+      return !keys.has(node);
+    });
+    if (clip.tracks.length !== before) {
+      console.log('Clip "' + clip.name + '": removed ' + (before - clip.tracks.length) + ' belly track(s)');
+    }
+  });
+}
+
+// Make a node actually drawable: itself, its children, its ancestors.
+function forceShow(node) {
+  for (let p = node; p; p = p.parent) p.visible = true;
+  node.traverse(o => {
+    o.visible = true;
+    if (o.isMesh) {
+      o.frustumCulled = false;
+      const mats = Array.isArray(o.material) ? o.material : [o.material];
+      mats.forEach(m => { if (m && m.opacity === 0) { m.opacity = 1; } if (m) m.visible = true; });
+    }
+  });
+}
+
+function fixTinyScale(node) {
+  if (node && node.scale.x < 1e-3 && node.scale.y < 1e-3 && node.scale.z < 1e-3) {
+    console.warn('"' + node.name + '" had ~zero scale in the file, resetting to 1');
+    node.scale.set(1, 1, 1);
+  }
+}
+
 function makeAnimator(root, clips) {
   const mixer = new THREE.AnimationMixer(root);
   const actions = {};
@@ -193,6 +238,8 @@ async function init() {
   girl = g.scene; boy = b.scene; stomach = s.scene;
 
   girl.position.set(0, 0, 0);
+  // skinned meshes often get culled by a stale bounding sphere
+  girl.traverse(o => { if (o.isMesh) o.frustumCulled = false; });
   scene.add(girl);
 
   boy.position.copy(CONFIG.boyPosition);
@@ -202,27 +249,38 @@ async function init() {
 
   stomachRoot.add(stomach);
 
-  // animations: idle + walk on the girl, idle on the boy
+  // find belly nodes BEFORE building animators so we can strip their tracks
+  prey = findNode(girl, CONFIG.preyName) || findNode(stomach, CONFIG.preyName) || findNode(girl, 'prey1');
+  digestTarget = findNode(girl, CONFIG.digestTargetName) || findNode(stomach, CONFIG.digestTargetName);
+
+  // diagnostics: every node name on the girl
+  const names = [];
+  girl.traverse(o => { if (o.name) names.push(o.name + (o.isMesh ? ' [mesh]' : '')); });
+  console.log('Girl nodes:', names);
+  console.log('Girl clips:', g.animations.map(c => c.name));
+  if (!prey) console.warn('Node "' + CONFIG.preyName + '" not found. Pick the right name from the list above.');
+  if (!digestTarget) console.warn('Node "' + CONFIG.digestTargetName + '" not found.');
+
+  stripTracksFor(g.animations, [prey, digestTarget, ...CONFIG.hiddenExtras.map(n => findNode(girl, n))]);
+
   girlAnim = makeAnimator(girl, g.animations);
   boyAnim = makeAnimator(boy, b.animations);
-  if (!girlAnim.has('idle')) console.warn('Girl has no "Idle" clip. Clips:', g.animations.map(c => c.name));
-  if (!girlAnim.has('walk')) console.warn('Girl has no "Walk" clip. Clips:', g.animations.map(c => c.name));
+  if (!girlAnim.has('idle')) console.warn('Girl has no "Idle" clip.');
+  if (!girlAnim.has('walk')) console.warn('Girl has no "Walk" clip.');
   girlAnim.setBase('idle', 0);
   boyAnim.setBase('idle', 0);
 
-  // prey1 / bellydigest live on the girl model (stomach file is the fallback)
-  prey = findNode(girl, CONFIG.preyName) || findNode(stomach, CONFIG.preyName) || findNode(girl, 'prey1');
-  digestTarget = findNode(girl, CONFIG.digestTargetName) || findNode(stomach, CONFIG.digestTargetName);
-  if (!prey) console.warn('Node "' + CONFIG.preyName + '" not found');
-  if (!digestTarget) console.warn('Node "' + CONFIG.digestTargetName + '" not found');
-
   if (prey) {
+    fixTinyScale(prey);
     preyHome.pos.copy(prey.position);
     preyHome.quat.copy(prey.quaternion);
     preyHome.scale.copy(prey.scale);
     prey.visible = false;
   }
-  if (digestTarget) digestTarget.visible = false;
+  if (digestTarget) {
+    fixTinyScale(digestTarget);
+    digestTarget.visible = false;
+  }
   CONFIG.hiddenExtras.forEach(n => { const o = findNode(girl, n); if (o) o.visible = false; });
 
   frameGirl();
@@ -261,7 +319,6 @@ function moveGirl(dt) {
     girlAnim.setBase('idle');
   }
 
-  // smooth turn toward movement direction
   let diff = targetYaw - girl.rotation.y;
   diff = Math.atan2(Math.sin(diff), Math.cos(diff));
   girl.rotation.y += diff * Math.min(1, CONFIG.turnSpeed * dt);
@@ -282,7 +339,7 @@ renderer.domElement.addEventListener('pointerup', e => {
   if (!downPos || !boy || state.eaten) return;
   const moved = Math.hypot(e.clientX - downPos.x, e.clientY - downPos.y);
   downPos = null;
-  if (moved > 5) return; // camera drag, not a click
+  if (moved > 5) return;
   if (hitsBoy(e)) eatBoy();
 });
 renderer.domElement.addEventListener('pointermove', e => {
@@ -296,7 +353,6 @@ function eatBoy() {
   state.digested = false;
   tween = null;
 
-  // teleport the boy into the stomach (far away, camera stays on the girl)
   scene.remove(boy);
   stomachRoot.add(boy);
   stomachRoot.updateWorldMatrix(true, true);
@@ -305,12 +361,11 @@ function eatBoy() {
   boy.position.copy(stomachRoot.worldToLocal(centerWorld));
   boy.rotation.set(0, 0, 0);
 
-  // prey1 becomes visible on the girl at its home pose
   if (prey) {
     prey.position.copy(preyHome.pos);
     prey.quaternion.copy(preyHome.quat);
     prey.scale.copy(preyHome.scale);
-    prey.visible = true;
+    forceShow(prey);
   }
   if (digestTarget) digestTarget.visible = false;
 
@@ -345,7 +400,7 @@ function resetWorld() {
 // ---------- BUTTONS ----------
 btnBurp.addEventListener('click', () => {
   playBurp();
-  girlAnim.overlay('burp'); // plays the girl's Burp clip if she has one
+  girlAnim.overlay('burp');
 });
 
 btnDigest.addEventListener('click', () => {
@@ -353,7 +408,6 @@ btnDigest.addEventListener('click', () => {
   state.digesting = true;
   btnDigest.disabled = true;
 
-  // target transform expressed in prey1's parent space
   let toPos = new THREE.Vector3(), toQuat = new THREE.Quaternion(), toScale = new THREE.Vector3();
   if (prey.parent === digestTarget.parent) {
     toPos.copy(digestTarget.position);
@@ -386,8 +440,8 @@ function updateTween(dt) {
     tween = null;
     state.digesting = false;
     state.digested = true;
-    prey.visible = false;          // prey1 has become bellydigest
-    digestTarget.visible = true;
+    prey.visible = false;
+    forceShow(digestTarget);
     setMsg('Digest complete. Hit Reset to run it again.');
   }
 }
